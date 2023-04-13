@@ -1,1 +1,361 @@
+#include "udf.h"    
 
+#include "sg_mphase.h"
+#include "math.h"
+#include "sg.h"
+#include "flow.h"
+#include "mem.h"
+#include "metric.h"
+
+
+
+#define L 0.005           /*工件厚度*/
+#define T_SAT 3100        /* 汽相线 K */
+#define PI 3.141592653    /*圆周率*/
+#define B0 3.9e12         /* 蒸发常数 */
+#define ma 56*0.001	      /*分子量 kg/mol */
+#define Ha 6.34e6		  /*蒸发潜热 J/kg */
+#define R 8.314  	 	  /*理想气体常数 J/K*mol */
+#define Ree 1             /*反冲压力系数 */
+#define Reez 1            /*反冲压力系数 */
+
+#define xx0 0.0035		  /*热源起始位置*/
+#define v 0.01            /*热源移动速度 m/s */
+#define R0 0.0006		  /*芯热源半径 m */ 
+#define r1 0.0006		  /*环热源内径*/
+#define r2 0.001	      /*环热源外径*/
+#define P 2000            /*芯热源功率 W */
+#define P1 2000			  /*环热源功率*/
+#define n 0.9		      /*热效率*/
+#define K0 1			  /*芯热源开关*/
+#define K1 1			  /*环热源开关*/
+
+DEFINE_SOURCE(laser_source,c,t,dS,eqn)
+{
+	real xc[ND_ND], x, y, z, time, Q,Q1, r, H, source, h, a, b;
+	Thread *sec_th;
+	sec_th=THREAD_SUB_THREAD(t,1);
+
+	time=RP_Get_Real("flow-time");
+        C_CENTROID(xc, c, t);
+	x=xc[0]+xx0-v*time;
+	y=xc[1];
+	z=xc[2];
+
+	H=0.003;                              /* 芯热源深度*/
+	h=0.001;                              /* 环热源深度*/
+
+	a = (r2 - r1) / 2;                    /*环热源宽度半径*/
+	b = (r2 + r1) / 2;                    /*环热源中心位置半径*/
+
+
+	r = sqrt(x*x + y*y);				  /*光斑上一点到芯热源中心位置半径*/
+   
+	Q=K0*n*P;
+	Q1=K1*n*P1;
+	
+	if (r <= R0&&z <= 0 && z >= -H)      
+    {
+        source=(9*Q/(PI*R0*R0*H*0.95))*exp(-9/(log(H/(-z))*R0*R0)*r*r);				    /* 芯热源 */
+		dS[eqn]=0;
+    }
+    
+	else if (r >= r1 && r <= r2 && z <= 0 && z >= -h)
+	{
+		source = (3 * Q1 / (PI*PI*a*b*h))*exp(-3 * (b - r)*(b - r) / a*a-3*z*z/(h*h));  /* 环热源 */
+		dS[eqn] = 0;
+	}
+	
+	else
+    {
+        source=0;
+        dS[eqn]=0;
+    }
+
+
+
+    return source;
+}
+DEFINE_ADJUST(store_VOF_gradient,domain)
+{
+	Thread *t;
+	Thread *ppt;
+	Thread **pt;
+	cell_t c;
+	int phase_domain_index=1;
+	Domain *pDomain = DOMAIN_SUB_DOMAIN(domain,phase_domain_index);
+	Alloc_Storage_Vars(pDomain,SV_VOF_RG,SV_VOF_G,SV_NULL);
+	Scalar_Reconstruction(pDomain, SV_VOF,-1,SV_VOF_RG,NULL);
+	Scalar_Derivatives(pDomain,SV_VOF,-1,SV_VOF_G,SV_VOF_RG, Vof_Deriv_Accumulate);
+
+	mp_thread_loop_c (t,domain,pt)
+	{
+		if (FLUID_THREAD_P(t))
+		{
+			ppt = pt[phase_domain_index];
+			begin_c_loop (c,t)
+			{
+				C_UDMI(c,t,0) = C_VOF_G(c,ppt)[0];
+				C_UDMI(c,t,1) = C_VOF_G(c,ppt)[1];
+				C_UDMI(c,t,2) = C_VOF_G(c,ppt)[2];
+			}
+			end_c_loop (c,t)
+		}
+	}
+	Free_Storage_Vars(pDomain,SV_VOF_RG,SV_VOF_G,SV_NULL);
+
+
+}
+
+/*x向反冲压力*/
+DEFINE_SOURCE(x_recoil_source,c,t,dS,eqn)
+{
+    real xc[ND_ND],x,y,z,r,time,T,xfen,recoil,x_source;
+	Thread *sec_th;
+
+	sec_th=THREAD_SUB_THREAD(t,1);
+	T=C_T(c,t);
+	time=RP_Get_Real("flow-time");
+	C_CENTROID(xc, c, t);
+    x=xc[0]+xx0-v*time;
+	y=xc[1];
+	z=xc[2];
+    r=sqrt(x*x+y*y);
+	xfen=C_UDMI(c,t,0)/sqrt(C_UDMI(c,t,0)*C_UDMI(c,t,0)+C_UDMI(c,t,1)*C_UDMI(c,t,1)+C_UDMI(c,t,2)*C_UDMI(c,t,2)+0.00000001);
+
+    if(r<=0.001)
+	{
+		if(T>=T_SAT&&C_VOF(c,sec_th)>=0.1&&C_VOF(c,sec_th)<=0.9)
+		{
+			recoil=(0.55*B0/sqrt(T))*exp(-ma*Ha/(R*T));
+			x_source=recoil*xfen;
+			C_UDMI(c,t,3)=x_source;
+		}
+		else
+			x_source=0;
+	}
+	else
+	{
+		x_source=0;
+	}
+	return x_source*Ree;
+}
+
+/*y向反冲压力*/
+DEFINE_SOURCE(y_recoil_source,c,t,dS,eqn)
+{
+    real xc[ND_ND],x,y,z,r,time,T,yfen,recoil,y_source;
+	Thread *sec_th;
+
+	sec_th=THREAD_SUB_THREAD(t,1);
+	T=C_T(c,t);
+	time=RP_Get_Real("flow-time");
+	C_CENTROID(xc, c, t);
+    x=xc[0]+xx0-v*time;
+	y=xc[1];
+	z=xc[2];
+    r=sqrt(x*x+y*y);
+	yfen=C_UDMI(c,t,1)/sqrt(C_UDMI(c,t,0)*C_UDMI(c,t,0)+C_UDMI(c,t,1)*C_UDMI(c,t,1)+C_UDMI(c,t,2)*C_UDMI(c,t,2)+0.00000001);
+
+    if(r<=0.001)
+	{
+		if(T>=T_SAT&&C_VOF(c,sec_th)>=0.1&&C_VOF(c,sec_th)<=0.9)
+		{
+			recoil = (0.55*B0 / sqrt(T))*exp(-ma*Ha / (R*T));
+			y_source=recoil*yfen;
+			C_UDMI(c,t,4)=y_source;
+		}
+		else
+			y_source=0;
+	}
+	else
+	{
+		y_source=0;
+	}
+	return y_source*Ree;
+}
+
+/*z向反冲压力*/
+DEFINE_SOURCE(z_recoil_source,c,t,dS,eqn)
+{
+    real xc[ND_ND],x,y,z,r,time,T,zfen,recoil,z_source;
+	Thread *sec_th;
+
+	sec_th=THREAD_SUB_THREAD(t,1);
+	T=C_T(c,t);
+	time=RP_Get_Real("flow-time");
+	C_CENTROID(xc, c, t);
+    x=xc[0]+xx0-v*time;
+	y=xc[1];
+	z=xc[2];
+    r=sqrt(x*x+y*y);
+	zfen=C_UDMI(c,t,2)/sqrt(C_UDMI(c,t,0)*C_UDMI(c,t,0)+C_UDMI(c,t,1)*C_UDMI(c,t,1)+C_UDMI(c,t,2)*C_UDMI(c,t,2)+0.00000001);
+
+    if(r<=0.001)
+	{
+		if(T>=T_SAT&&C_VOF(c,sec_th)>=0.1&&C_VOF(c,sec_th)<=0.9)
+		{
+			recoil = (0.55*B0 / sqrt(T))*exp(-ma*Ha / (R*T));
+			z_source=recoil*zfen;
+			C_UDMI(c,t,5)=z_source;
+		}
+		else
+			z_source=0;
+	}
+	else
+	{
+		z_source=0;
+	}
+	return z_source*Reez;
+}
+
+
+
+DEFINE_PROPERTY(surface_tension, cell, cell_thread)/*表面张力,加载于相间作用力*/
+{
+	real T = C_T(cell, cell_thread);
+	real source;
+	if (T >= 1727)
+		source = 1.5 - 0.0002 * (T - 1727);
+	else
+		source = 1.5;
+	return source;
+}
+
+
+
+
+DEFINE_SOURCE(udf_fuli, cell, thread, dS, eqn)/*浮力,加载于单元z轴源项*/ 
+
+{
+	real source;
+	real p, g, B, T, Tl;
+	T = C_T(cell, thread);
+	p = 3100;
+	g = -9.81;
+	B = 0.0001;
+	Tl = 1727;
+	if (T > Tl)
+		source = -p * g*B*(T - Tl);
+	else
+		source = 0;
+	dS[eqn] = 0;
+	return source;
+}
+
+
+
+
+DEFINE_PROPERTY(udf_density, cell, thread)/*材料密度,加载于材料属性*/
+{
+	real den, T;
+	T = C_T(cell, thread);
+	if (T <= 1540)
+		den = 7920+((7310-7920)/(1540-300))*(T-300);
+	else if (T > 1540 && T <= 1687)
+		den = 7310 + ((7070 - 7310) / (1687 - 1540))*(T - 1540);
+	else if (T > 1687 && T <= 3500)
+		den = 7070 + ((5450 - 7070) / (3500 - 1687))*(T - 1687);
+	else
+		den = 5450;
+	return den;
+}
+
+
+DEFINE_SPECIFIC_HEAT(udf_specific_heat, T, Tref, h, yi)/*材料比热,加载于材料属性*/
+{
+	real sh;
+	if (T <= 1540)
+		sh = 450 + ((770 - 450) / (1540 - 300))*(T - 300);
+	else if (T > 1540 && T <= 1687)
+		sh = 770 + ((6000 - 770) / (1687 - 1540))*(T - 1540);
+	else if (T > 1687 && T <= 3500)
+		sh = 820;
+	else
+		sh = 820;
+	*h = sh * (T - Tref);
+	return sh;
+}
+
+DEFINE_PROPERTY(udf_thermal_conductivity, cell, thread)/*材料导热,加载于材料属性*/
+{
+		real tc, T;
+		T = C_T(cell, thread);
+		if (T <= 1630)
+			tc = 13.8 + ((30.9 - 13.8) / (1630 - 300))*(T - 300);
+		else if (T > 1630 && T <= 1687)
+			tc = 30.9 + ((30.18 - 30.9) / (1687 - 1630))*(T - 1630);
+		else if (T > 1687 && T <= 3500)
+			tc = 30.18 + ((58.53 - 30.18) / (3500 - 1687))*(T - 1687);
+		else
+			tc = 58.53;
+		return tc;
+}
+
+
+DEFINE_PROPERTY(udf_viscosity, cell, thread)/*材料粘度,加载于材料属性*/
+{
+	real vis, T;
+	T = C_T(cell, thread);
+	if (T <= 1540)
+		vis = 1000;
+	if (T > 1540 && T <= 1687)
+		vis =9.01+ ((7.59 - 9.01) / (1687 - 1540))*(T - 1540);
+	else if (T > 1687 && T <= 2450)
+		vis = 7.59 + ((2.79 - 7.59) / (2450 - 1687))*(T - 1687);
+	else if (T > 2450 && T <= 3500)
+		vis =2.79+ ((1.44 - 2.79) / (3500 - 2450))*(T - 2450);
+	else
+		vis = 1.44;
+	return vis / 1000;
+}
+
+DEFINE_SOURCE(convenction_source, c, t, dS, eqn)/*对流散热,加载于单元能量源项*/
+{
+	real T, source;
+	real vof2, cp,cg,metal,gas;
+	cp = 780; //金属比热
+	cg = 1006.43; //空气比热
+	metal = 7200; //金属密度
+	gas = 1.225; //空气密度
+	Thread* sec;
+	sec = THREAD_SUB_THREAD(t, 1);
+	vof2 = C_VOF(c, sec);
+	T = C_T(c, t);
+	if (vof2 > 0 && vof2 < 1 && T>300)
+	{
+		source = -100 * (T - 300) * (vof2 * cp + (1 - vof2) * cg) * (gas * (1 - vof2) + metal * vof2) / (0.5 * (cg * gas + cp * metal)) * C_UDMI(c, t, 3);
+		dS[eqn] = 0;
+	}
+	else
+	{
+		source = 0;
+		dS[eqn] = 0;
+	}
+	return source;
+}
+
+DEFINE_SOURCE(radiation_source, c, t, dS, eqn)/*辐射散热,加载于单元能量源项*/
+{
+	real T, source;
+	real vof2, cp, cg, metal, gas;
+	cp = 780; //金属比热
+	cg = 1006.43; //空气比热
+	metal = 7200; //金属密度
+	gas = 1.225; //空气密度
+	Thread* sec;
+	sec = THREAD_SUB_THREAD(t, 1);
+	vof2 = C_VOF(c, sec);
+	T = C_T(c, t);
+	if (vof2 > 0 && vof2 < 1 && T>300)
+	{
+		source = -0.8 * 5.67 * (1e-8) * (T * T * T * T - 300 * 300 * 300 * 300) * (vof2 * cp + (1 - vof2) * cg) * (gas * (1 - vof2) + metal * vof2) / (0.5 * (cg * gas + cp * metal)) * C_UDMI(c, t, 3);
+		dS[eqn] = 0;
+	}
+	else
+	{
+		source = 0;
+		dS[eqn] = 0;
+	}
+	return source;
+}
